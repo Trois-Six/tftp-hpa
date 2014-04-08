@@ -20,6 +20,7 @@
 void set_signal(int, void (*)(int), int);
 void *tfmalloc(size_t);
 char *tfstrdup(const char *);
+char *rtrim(char *s, char c);
 
 extern int verbosity;
 

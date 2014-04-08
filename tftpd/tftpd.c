@@ -109,7 +109,12 @@ int verbosity = 0;
 
 struct formats;
 #ifdef WITH_REGEX
+char *dynamicrootfolder = NULL;
 static struct rule *rewrite_rules = NULL;
+#include <net/if_arp.h>
+#include <net/if.h>
+#include <sys/stat.h>
+#define MAXLINE 16384
 #endif
 
 int tftp(struct tftphdr *, int);
@@ -347,9 +352,27 @@ static struct option long_options[] = {
     { "port-range",  1, NULL, 'R' },
     { "map-file",    1, NULL, 'm' },
     { "pidfile",     1, NULL, 'P' },
+    { "dynamicrootfolder", 1, NULL, 'D' },
     { NULL, 0, NULL, 0 }
 };
-static const char short_options[] = "46cspvVlLa:B:u:U:r:t:T:R:m:P:";
+
+static const char short_options[] = "46cspvVlLa:B:u:U:r:t:T:R:m:P:D:";
+
+static char *ethernet_mactoa(struct sockaddr *addr) { 
+    static char buff[256]; 
+    unsigned char *ptr = (unsigned char *) addr->sa_data;
+    sprintf(buff, "%02X-%02X-%02X-%02X-%02X-%02X", (ptr[0] & 0xff), 
+            (ptr[1] & 0xff), (ptr[2] & 0xff), (ptr[3] & 0xff), 
+            (ptr[4] & 0xff), (ptr[5] & 0xff));
+    return (buff); 
+} 
+
+char *rtrim(char *s, char c) {
+    char* back = s + strlen(s);
+    while(*--back == c);
+    *(back+1) = '\0';
+    return s;
+}
 
 int main(int argc, char **argv)
 {
@@ -380,6 +403,17 @@ int main(int argc, char **argv)
     char *p, *ep;
 #ifdef WITH_REGEX
     char *rewrite_file = NULL;
+    int arpsock;
+    struct arpreq arpreq;
+    struct sockaddr_in *arpsin;
+    struct ifreq arpnicnumber[24];
+    struct ifconf arpifconf;
+    int i = 0, arpnicount = 0;
+    struct stat sb;
+    char *bufmacfile;
+    int bufmaclen = 0;
+    FILE *macfile;
+    char rootfolderline[MAXLINE];
 #endif
     const char *pidfile = NULL;
     u_short tp_opcode;
@@ -492,6 +526,17 @@ int main(int argc, char **argv)
                 exit(EX_USAGE);
             }
             rewrite_file = optarg;
+            break;
+        case 'D':
+            if (dynamicrootfolder) {
+                syslog(LOG_ERR, "Multiple -D options");
+                exit(EX_USAGE);
+            }
+            if (secure == 1) {
+                syslog(LOG_ERR, "-D and -s can't coexist");
+                exit(EX_USAGE);
+            }
+            dynamicrootfolder = optarg;
             break;
 #endif
         case 'v':
@@ -1033,6 +1078,94 @@ int main(int argc, char **argv)
         exit(EX_IOERR);
     }
 
+#ifdef WITH_REGEX
+    if (dynamicrootfolder) {
+
+        /* Find MAC Address of peer */
+        arpsock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (arpsock < 0) {
+            syslog(LOG_ERR, "sock: %m");
+            exit(EX_IOERR);
+        } else {
+            arpifconf.ifc_buf = (caddr_t)arpnicnumber;
+            arpifconf.ifc_len = sizeof(arpnicnumber);
+        }
+        if (!ioctl(arpsock,SIOCGIFCONF,(char*)&arpifconf)) {
+            arpnicount = arpifconf.ifc_len/(sizeof(struct ifreq));
+            for (i=0; i<arpnicount; i++) { 
+                bzero(&arpreq, sizeof(arpreq));
+                arpsin = (struct sockaddr_in *) &arpreq.arp_pa;
+                arpsin->sin_family = AF_INET;
+                bcopy(&from.si.sin_addr, &arpsin->sin_addr, sizeof(struct in_addr));
+                strcpy(arpreq.arp_dev, arpnicnumber[i].ifr_name);
+    	        if (!(ioctl(arpsock, SIOCGARP, &arpreq))) {
+                    /*
+                    syslog(LOG_INFO, "IP: %s", inet_ntoa(arpsin->sin_addr));
+                    syslog(LOG_INFO, "client MAC address: %s", ethernet_mactoa(&arpreq.arp_ha));
+                    */
+                    break;
+                }
+    	    }
+        } else {
+            syslog(LOG_ERR, "ioctl SIOCGIFCONF: %m");
+            exit(EX_IOERR);
+        }
+        close(arpsock);
+
+        /* Load root folder file */
+        bufmaclen = strlen(rtrim(dynamicrootfolder, '/')) + 1 + strlen(ethernet_mactoa(&arpreq.arp_ha)) + strlen(".root") + 1;
+        bufmacfile = malloc(sizeof(char) * bufmaclen);
+        snprintf(bufmacfile, bufmaclen, "%s/%s.root", rtrim(dynamicrootfolder, '/'), ethernet_mactoa(&arpreq.arp_ha));
+        syslog(LOG_INFO, "Filename root folder: %s", bufmacfile);
+        if (stat(bufmacfile, &sb) == -1) {
+            syslog(LOG_INFO, "no dynamic root file %s: %m", bufmacfile);
+        } else {
+            if (!S_ISREG(sb.st_mode) && !S_ISLNK(sb.st_mode)) {
+                syslog(LOG_ERR, "file %s is not a regular file nor a symlink", bufmacfile);
+            } else {
+                macfile = fopen(bufmacfile, "r");
+                if (macfile == NULL) {
+                    free(bufmacfile);
+                    syslog(LOG_ERR, "cannot open file %s: %m", bufmacfile);
+                    exit(EX_NOINPUT);
+                }
+                if (fgets(rootfolderline, MAXLINE, macfile) != NULL) {
+                    rootfolderline[strcspn(rootfolderline, "\n")] = '\0';
+                } else {
+                    fclose(macfile);
+                    free(bufmacfile);
+                    syslog(LOG_ERR, "%s: %m", rootfolderline);
+                    exit(EX_NOINPUT);
+                }
+                fclose(macfile);
+                if (chdir(rootfolderline)) {
+                    free(bufmacfile);
+                    syslog(LOG_ERR, "%s: %m", dirs[0]);
+                    exit(EX_NOINPUT);
+                }
+            }
+        }
+        free(bufmacfile);
+
+        /* Load rule map file */
+        bufmaclen = strlen(rtrim(dynamicrootfolder, '/')) + 1 + strlen(ethernet_mactoa(&arpreq.arp_ha)) + strlen(".rule") + 1;
+        bufmacfile = malloc(sizeof(char) * bufmaclen);
+        snprintf(bufmacfile, bufmaclen, "%s/%s.rule", rtrim(dynamicrootfolder, '/'), ethernet_mactoa(&arpreq.arp_ha));
+        syslog(LOG_INFO, "Filename map rule file: %s", bufmacfile);
+        if (stat(bufmacfile, &sb) == -1) {
+            syslog(LOG_INFO, "no dynamic rule map file %s: %m", bufmacfile);
+        } else {
+            if (!S_ISREG(sb.st_mode) && !S_ISLNK(sb.st_mode)) {
+                syslog(LOG_ERR, "file %s is not a regular file nor a symlink", bufmacfile);
+            } else {
+                freerules(rewrite_rules);
+                rewrite_rules = read_remap_rules(bufmacfile);
+            }
+        }
+        free(bufmacfile);
+    }
+#endif
+
     /* Disable path MTU discovery */
     pmtu_discovery_off(peer);
 
@@ -1444,7 +1577,7 @@ static int validate_access(char *filename, int mode,
     tsize_ok = 0;
     *errmsg = NULL;
 
-    if (!secure) {
+    if (!secure && dynamicrootfolder==NULL) {
         if (*filename != '/') {
             *errmsg = "Only absolute filenames allowed";
             return (EACCESS);
